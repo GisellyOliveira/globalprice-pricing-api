@@ -17,6 +17,46 @@ def home():
         "service": "GlobalPrice Secondary API"
     })
 
+def fetch_exchange_rate(source, target):
+    """
+    Attempt to retrieve the quote. If the direct rate (BRL->TARGET) fails,
+    try the inverse rate (TARGET->BRL) and reverse the calculation.
+    Returns: (rate, status_ok?)
+    """
+    # First Attempt (Users choice)
+    pair_direct = f"{source}-{target}"
+    url_direct = f"https://economia.awesomeapi.com.br/last/{pair_direct}"
+
+    try:
+        response = requests.get(url_direct, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            key = f"{source}{target}"
+            if key in data:
+                return float(data[key]['bid']), True
+    except Exception:
+        pass
+    
+    # Second Attempt (Inverts the search to get not found value)
+    pair_inverse = f"{target}-{source}"
+    url_inverse = f"https://economia.awesomeapi.com.br/last/{pair_inverse}"
+
+    try:
+        response = requests.get(url_inverse, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            key = f"{target}{source}"
+            if key in data:
+                rate_inverse = float(data[key]['bid'])
+                if rate_inverse > 0:
+                    real_rate = 1/ rate_inverse
+                    return real_rate, True
+    except Exception as e:
+        print(f"Error in inverse attempt: {e}")
+    
+    return 0.0, False
+
+
 @app.route('/convert', methods=['POST'])
 def convert_price():
     """
@@ -42,35 +82,33 @@ def convert_price():
             return jsonify({
                 "currency": "BRL",
                 "converted_price": base_price_brl,
-                "rate": 1.0,
-                "message": "Same currency, no conversion."
+                "rate": 1.0
             })
         
-        pair = f"BRL-{target_currency}"
-        url = f"https://economia.awesomeapi.com.br/last/{pair}"
-        response = requests.get(url, timeout=5)
+        exchange_rate, success = fetch_exchange_rate("BRL", target_currency)
 
-        if response.status_code != 200:
-            return jsonify({"error": "Error querying external exchange rate API"}), 502
-        
-        api_data = response.json()
-        key = pair.replace('-', '')
-
-        if key not in api_data:
-            return jsonify({"error": f"Currency {target_currency} not found or unavailable."}), 404
-    
-        # Get the 'bid' quote
-        exchange_rate = float(api_data[key]['bid'])
+        if not success:
+            return jsonify({
+                "error": f"Could not fetch rate for {target_currency}. Exchange market might be closed or pair unavailable."
+            }), 404
 
         # Business Rule: We add a 2% margin (Spread) to the conversion.
         margin = 1.02
         final_price = (base_price_brl * exchange_rate) * margin
 
+        # Rounding price: if < 0.01 returns 8 decimals, else 2 decimals.
+        if exchange_rate < 0.01:
+            precision = 8
+        else:
+            precision = 2
+        
+        final_price_formatted = round(final_price, precision)
+
         return jsonify({
             "currency": target_currency,
             "original_price_brl": base_price_brl,
             "rate_used": exchange_rate,
-            "converted_price": round(final_price, 2),
+            "converted_price": final_price_formatted,
             "note": "Includes a 2% safety margin."
         })
     
