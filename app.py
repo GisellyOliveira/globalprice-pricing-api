@@ -6,6 +6,7 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+app.json.sort_keys = False
 
 # AI Setttings
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -176,15 +177,17 @@ def convert_price():
         # Rounding price: if < 0.01 (e.g.: digital currencies) returns 8 decimals, else 2 decimals.
         precision = 8 if exchange_rate < 0.01 else 2
         final_price_formatted = round(final_price, precision)
+        spread_pct = (margin - 1) * 100
 
         return jsonify({
-            "currency": target_currency,
             "original_price_brl": base_price_brl,
+            "exchange_currency": target_currency,
+            "converted_price": final_price_formatted,
             "rate_used": exchange_rate,
             "margin_applied": margin,
-            "converted_price": final_price_formatted,
-            "ai_analysis": reason,
-            "market_volatility_24h": f"{volatility:.2f}%"
+            "spread_percentage": f"{spread_pct:.2f}%",
+            "market_volatility_24h": f"{volatility:.2f}%",
+            "ai_analysis": reason
         })
     
     except ValueError:
