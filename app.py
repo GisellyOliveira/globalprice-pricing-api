@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+import redis
 import google.generativeai as genai
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,6 +19,15 @@ FACTORY_DEFAULTS = {
     "use_ai": True,
     "ai_model": "gemini-2.5-flash" 
 }
+
+# --- Redis Settings ---
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+try:
+    cache = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True, socket_connect_timeout=1)
+    cache.ping()
+except Exception:
+    cache = None
+
 
 def load_settings():
     """
@@ -374,26 +384,32 @@ def fetch_exchange_rate(source, target):
         - Network timeouts are capped at 3 seconds to prevent upstream latency propagation.
         - Floating-point division by zero is internally guarded.
     """
+    print("DEBUG: Buscando taxa para {source}->{target}") # DEBUG
     # First Attempt (Users choice)
     pair_direct = f"{source}{target}"
     url_direct = f"https://economia.awesomeapi.com.br/last/{source}-{target}"
 
     try:
-        response = requests.get(url_direct, timeout=3)
+        response = requests.get(url_direct, timeout=10)
         if response.status_code == 200:
             data = response.json()
             if pair_direct in data:
                 item = data[pair_direct]
                 return float(item['bid']), float(item['high']), float(item['low']), True
-    except Exception:
+            else:
+                print(f"DEBUG: Chave direta {url_direct} não encontrada no JSON.") # DEBUG
+    except Exception as e:
+        print(f"DEBUG: Erro na tentativa direta: {e}") # DEBUG
         pass
     
     # Second Attempt (Inverts the search to get not found value)
     pair_inverse = f"{target}{source}"
     url_inverse = f"https://economia.awesomeapi.com.br/last/{target}-{source}"
 
+    print(f"DEBUG: Tentando inversa: {url_inverse}") # DEBUG
+
     try:
-        response = requests.get(url_inverse, timeout=3)
+        response = requests.get(url_inverse, timeout=5)
         if response.status_code == 200:
             data = response.json()
             if pair_inverse in data:
@@ -407,8 +423,14 @@ def fetch_exchange_rate(source, target):
                     real_high = 1 / low_inverse
                     real_low = 1 / high_inverse
                     return real_rate, real_high, real_low, True
-    except Exception:
-        pass
+            else:
+                print(f"DEBUG: Chave inversa {rate_inverse} não encontrada. Veio: {list(data.keys())}") # DEBUG
+        else:
+            print(f"DEBUG: Falha na API inversa. Status: {response.status_code}") # DEBUG
+                  
+    except Exception as e:
+        #pass
+        print(f"DEBUG: Erro na tentativa inversa: {e}") # DEBUG
     
     return 0.0, 0.0, 0.0, False
 
@@ -542,6 +564,18 @@ def convert_price():
     if not data or 'base_price' not in data or 'target_currency' not in data:
         return jsonify({"error": "Invalid data."}), 400
     
+    # --- Check REDIS ---
+    is_panic_mode = False
+    panic_volatility = 0.0
+
+    if cache:
+        try:
+            if cache.get("MARKET_PANIC_MODE") == "TRUE":
+                is_panic_mode = True
+                panic_volatility = float(cache.get("MARKET_LAST_VOLATILITY") or 5.0)
+        except Exception:
+            pass
+    
     try:
         settings = load_settings()
         base_price_brl = float(data.get('base_price', 0))
@@ -560,18 +594,30 @@ def convert_price():
                 "error": f"Could not fetch rate for {target_currency}. Exchange market might be closed or pair unavailable."
             }), 404
         
-        # Calculate Volatility
-        volatility = ((high - low) / low) * 100 if low > 0 else 0.0
-        # Logic of "Automatic Profit Protection"
-        threshold = settings['volatility_threshold']
+        # Calculate Volatility (WATCHDOG x IA)
+        # Scenario #1 - PANIC DETECTED!!!
+        if is_panic_mode and target_currency in ['BTC', 'ETH']:
+            margin = 1 + (panic_volatility * 10 / 100)
+            if margin < 1.05: margin = 1.05
 
-        if volatility > threshold:
-            margin = 1 + (volatility / 100)
-            reason = f"⚠️ HIGH VOLATILITY ALERT: {volatility:.2f}% > Limit {threshold}%. Margin auto-adjusted to match volatility."
-            status_note = "Auto-Hedge Active"
+            reason = f"🐶 WALTER ALERTS: 🚨 Real-time anomaly on Binance! Volatility {panic_volatility:.2f}%."
+            status_note = "CRITICAL: Watchdog Intervention 🐶"
+            vol_display = f"{panic_volatility:.2f}% (Instant)"
+        
+        # Scenario # 2 - NORMAL FLOW (Auto-Hedge or AI)
         else:
-            margin, reason = get_ai_safety_margin(target_currency, volatility)
-            status_note = "Standard Optimization"
+          volatility = ((high - low) / low) * 100 if low > 0 else 0.0
+          # Logic of "Automatic Profit Protection"
+          threshold = settings['volatility_threshold']
+
+          if volatility > threshold:
+              margin = 1 + (volatility / 100)
+              reason = f"⚠️ HIGH VOLATILITY ALERT: {volatility:.2f}% > Limit {threshold}%. Margin auto-adjusted to match volatility."
+              status_note = "Auto-Hedge Active"
+          else:
+              margin, reason = get_ai_safety_margin(target_currency, volatility)
+              status_note = "Standard Optimization"
+              vol_display = f"{volatility:.2f}% (24h)"
         
         final_price = (base_price_brl * exchange_rate) * margin
         prec = 8 if exchange_rate < 0.01 else 2
@@ -585,8 +631,9 @@ def convert_price():
             "rate_used": exchange_rate,
             "margin_applied": margin,
             "spread_percentage": f"{spread_pct:.2f}%",
-            "market_volatility_24h": f"{volatility:.2f}%",
-            "ai_analysis": reason
+            "market_volatility": vol_display,
+            "ai_analysis": reason,
+            "config_mode": "Watchdog Override" if is_panic_mode else ("AI" if settings["use_ai"] else "Manual")
         })
     
     except ValueError:
