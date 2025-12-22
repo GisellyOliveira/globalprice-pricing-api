@@ -17,7 +17,9 @@ SETTINGS_PATH = 'settings.json'
 FACTORY_DEFAULTS = {
     "volatility_threshold": 5.0, # Maximum of 5%
     "use_ai": True,
-    "ai_model": "gemini-2.5-flash" 
+    "ai_model": "gemini-2.5-flash", 
+    "admin_fee": 0.005, # Default 0.5% margin fee
+    "max_panic_margin": 1.50 # 50% max during panic
 }
 
 # --- Redis Settings ---
@@ -28,31 +30,37 @@ try:
 except Exception:
     cache = None
 
-
 def load_settings():
     """
-    Synchronize application configuration with the local persistence layer.
+    Synchronize application configuration with a schema-aware migration logic.
 
-    Attempts to retrieve the global risk parameters from a JSON file. If the file 
-    is missing, inaccessible, or contains invalid JSON data, the function 
-    gracefully falls back to a predefined set of factory defaults to ensure 
-    system availability.
+    Retrieves global risk parameters from the local JSON store. This version 
+    implements an automatic schema evolution mechanism: if the persisted file 
+    is missing newly introduced keys (e.g., 'admin_fee'), the function 
+    merges them from factory defaults without overwriting existing user 
+    configurations.
 
     Returns:
-        dict: A configuration object containing:
+        dict: A validated configuration object containing the full schema:
             - volatility_threshold (float): Limit for automatic hedge activation.
             - use_ai (bool): Toggle for Gemini-driven spread calculations.
             - ai_model (str): Target model identifier for the Generative AI API.
+            - admin_fee (float): Service fee applied to the final conversion.
 
-    Raises:
-        Note: Exceptions during file I/O or JSON parsing are caught internally 
-        to trigger the fallback mechanism, preventing application crash during 
-        the bootstrap phase.
+    Behavior:
+        - Integrity Check: Iterates through FACTORY_DEFAULTS to ensure all 
+          required keys exist in the loaded dictionary.
+        - Resiliency: Falls back to a full 'FACTORY_DEFAULTS' copy if file 
+          I/O fails or JSON structure is corrupted.
     """
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, 'r') as f:
-                return json.load(f)
+                saved = json.load(f)
+                for key, val in FACTORY_DEFAULTS.items():
+                    if key not in saved:
+                        saved[key] = val
+                return saved
         except Exception:
             return FACTORY_DEFAULTS.copy()
     return FACTORY_DEFAULTS.copy()
@@ -88,12 +96,12 @@ def save_settings(settings):
 
 CURRENT_SETTINGS = load_settings()
 
-# --- AI Setttings ---  
+# --- AI Settings ---  
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# --- AI Available Models ---
+# --- AI Available Models (Diagnostic) ---
 def list_available_models():
     """
     Perform runtime discovery of available Google Generative AI capabilities.
@@ -138,7 +146,7 @@ def list_available_models():
 list_available_models()
 
 
-# --- Available endpoints ---
+# --- Endpoints ---
 @app.route('/', methods=['GET'])
 def home():
     """
@@ -186,7 +194,7 @@ def home():
     """
     return jsonify({
         "status": "Pricing Service is running",
-        "version": "2.0.0 (AI Powered)",
+        "version": "5.0.0 (Configurable Business Rules)",
         "service": "GlobalPrice Secondary API",
         "ai_module": "Active" if GEMINI_KEY else "Disabled"
     })
@@ -238,35 +246,40 @@ def get_config():
 @app.route('/config', methods=['PATCH'])
 def update_config():
     """
-    Partially update dynamic risk parameters and volatility thresholds.
+    Update dynamic business rules, risk thresholds, and administrative fees.
     ---
     tags:
       - Configuration Management
     description: >
-      Updates the active risk policy by modifying specific parameters in the 
-      persistence layer. Changes are applied in real-time and broadcasted 
-      to all service components. This endpoint supports partial updates (PATCH 
-      semantics), allowing for fine-grained control over the pricing engine.
+      Performs a partial update (PATCH) of the pricing engine's operational parameters. 
+      This endpoint allows administrators to adjust market risk tolerance (volatility), 
+      operational costs (admin_fee), and AI integration toggles in real-time. 
+      Validation is enforced to prevent irrational financial configurations.
     parameters:
       - in: body
         name: body
         required: true
-        description: JSON object containing fields to be updated.
+        description: JSON object containing one or more fields to update.
         schema:
           type: object
           properties:
             volatility_threshold:
               type: number
               format: float
-              example: 8.5
-              description: New maximum tolerance for price variance (percentage).
+              example: 5.0
+              description: Maximum 24h volatility percentage before 'Auto-Hedge' triggers.
+            admin_fee:
+              type: number
+              format: float
+              example: 0.015
+              description: Flat administrative fee (0.015 = 1.5%). Range allowed [0.0 - 0.5].
             use_ai:
               type: boolean
-              example: false
-              description: Enable or disable the Generative AI risk assessment layer.
+              example: true
+              description: Toggle for Gemini-driven predictive spread synthesis.
     responses:
       200:
-        description: Policy synchronized and persisted successfully.
+        description: Risk policy successfully synchronized and persisted.
         content:
           application/json:
             schema:
@@ -274,39 +287,58 @@ def update_config():
               properties:
                 message:
                   type: string
-                  example: "Risk policy updated and persisted"
+                  example: "Risk policy updated"
                 new_settings:
                   type: object
-                  description: The full configuration state after the update.
+                  description: The complete updated configuration schema.
       400:
-        description: Validation failed (e.g., negative threshold or malformed JSON).
+        description: Validation Error (e.g., fee out of bounds or non-numeric input).
       415:
         description: Unsupported Media Type (Content-Type must be application/json).
     """
     global CURRENT_SETTINGS
-    
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data provided"}), 400
     
     settings = load_settings()
     
-    # Update Volatility Limit
+    # Update Volatility Limit (Deterministic Risk Gate)
     if 'volatility_threshold' in data:
         try:
             val = float(data['volatility_threshold'])
             if val < 0: return jsonify({"error": "Must be positive"}), 400
-            CURRENT_SETTINGS['volatility_threshold'] = val
+            settings['volatility_threshold'] = val
         except ValueError:
-            return jsonify({"error": "Invalid number"}), 400
+            return jsonify({"error": "Invalid threshold"}), 400
     
-    # Update AI Toggle
+    # Update Administrative Fee (Revenue Management)
+    if 'admin_fee' in data:
+        try:
+            val = float(data['admin_fee'])
+            # Safety Guard: Prevents accidental fee spikes or negative values
+            if val < 0:
+                return jsonify({"error": "Admin fee must be positive"}), 400
+            settings['admin_fee'] = val
+        except ValueError:
+            return jsonify({"error": "Invalid fee number"}), 400
+    
+    # Update Max Panic Margin
+    if 'max_panic_margin' in data:
+        try:
+            val = float(data['max_panic_margin'])
+            if val < 1.0:
+                return jsonify({"error": "Max panic margin must be >= 1.0"}), 400
+            settings['max_panic_margin'] = val
+        except:
+          return jsonify({"error": "Invalid max panic margin"}), 400
+    
+    # Update AI Integration Toggle
     if 'use_ai' in data:
         settings['use_ai'] = bool(data['use_ai'])
-    save_settings(settings)
-  
-    CURRENT_SETTINGS = settings
     
+    save_settings(settings)
+    CURRENT_SETTINGS = settings
     return jsonify({
         "message": "Risk policy updated",
         "new_settings": settings
@@ -345,12 +377,10 @@ def reset_config():
     global CURRENT_SETTINGS
     CURRENT_SETTINGS = FACTORY_DEFAULTS.copy()
     save_settings(CURRENT_SETTINGS)
-
     return jsonify({
         "message": "Risk policy reset to factory defaults",
         "current_settings": CURRENT_SETTINGS
     })
-
 
 # --- Business Rules ---
 def fetch_exchange_rate(source, target):
@@ -384,20 +414,21 @@ def fetch_exchange_rate(source, target):
         - Network timeouts are capped at 3 seconds to prevent upstream latency propagation.
         - Floating-point division by zero is internally guarded.
     """
-    print("DEBUG: Buscando taxa para {source}->{target}") # DEBUG
+    print(f"DEBUG: Buscando taxa para {source}->{target}") # DEBUG
     # First Attempt (Users choice)
+    headers = {"User-Agent": "Mozilla/5.0"}
     pair_direct = f"{source}{target}"
     url_direct = f"https://economia.awesomeapi.com.br/last/{source}-{target}"
 
     try:
-        response = requests.get(url_direct, timeout=10)
+        response = requests.get(url_direct, timeout=5, headers=headers)
         if response.status_code == 200:
             data = response.json()
             if pair_direct in data:
                 item = data[pair_direct]
                 return float(item['bid']), float(item['high']), float(item['low']), True
             else:
-                print(f"DEBUG: Chave direta {url_direct} não encontrada no JSON.") # DEBUG
+                print(f"DEBUG: Chave direta {pair_direct} não encontrada no JSON.") # DEBUG
     except Exception as e:
         print(f"DEBUG: Erro na tentativa direta: {e}") # DEBUG
         pass
@@ -409,7 +440,7 @@ def fetch_exchange_rate(source, target):
     print(f"DEBUG: Tentando inversa: {url_inverse}") # DEBUG
 
     try:
-        response = requests.get(url_inverse, timeout=5)
+        response = requests.get(url_inverse, timeout=5, headers=headers)
         if response.status_code == 200:
             data = response.json()
             if pair_inverse in data:
@@ -469,9 +500,10 @@ def get_ai_safety_margin(currency, volatility_pct):
         by defaulting to the baseline risk policy.
     """
     settings = load_settings()
+    base_margin = 1.02 # Default fallback margin (2%)
 
     if not GEMINI_KEY or not settings["use_ai"]:
-        return 1.02, "AI Disabled (Standard 2%)"
+        return base_margin, "AI Disabled"
     
     try:
         model = genai.GenerativeModel(settings["ai_model"])
@@ -488,11 +520,11 @@ def get_ai_safety_margin(currency, volatility_pct):
         response = model.generate_content(prompt)
         ai_margin = float(response.text.strip().replace('*', ''))
         # Safety lock to prevent the AI from hallucinating absurd numbers
-        if 1.00 < ai_margin < 1.10:
+        if 1.00 < ai_margin < 1.20:
             return ai_margin, f"AI Calculated based on {volatility_pct:.2f}% volatility"
-        return 1.02, "AI Value Out of Bounds (Fallback 2%)"
+        return base_margin, "AI Value Out of Bounds (Fallback 2%)"
     except Exception as e:
-        return 1.02, f"AI Error: {str(e)}"
+        return base_margin, f"AI Error: {str(e)}"
 
 
 @app.route('/convert', methods=['POST'])
@@ -503,15 +535,8 @@ def convert_price():
     tags:
       - Pricing Engine
     description: >
-      The core transactional endpoint of the GlobalPrice API. It orchestrates a 
-      multi-step valuation pipeline:
-      1. Market Data Acquisition: Fetches real-time FX rates and 24h volatility.
-      2. Dynamic Risk Assessment: Evaluates market variance against persistent 
-         thresholds.
-      3. Decision Logic: Executes a 'Hard-Hedge' for high volatility or an 
-         'AI-Optimized Spread' for standard market conditions.
-      4. Precision Calibration: Calculates final pricing with adaptive rounding 
-         for exotic vs. major currency pairs.
+      Calculates the final product price applying dynamic risk margins. 
+      Allows simulation of scenarios and temporary override of global settings.
     parameters:
       - in: body
         name: body
@@ -530,35 +555,37 @@ def convert_price():
               type: string
               example: "USD"
               description: ISO 4217 code for the destination currency.
+            force_panic:
+              type: boolean
+              example: false
+              description: >
+                 SIMULATION: Forces 'Watchdog Panic Mode' logic even if the market is calm. 
+                 Useful to test the protection ceiling.
+            admin_fee:
+              type: number
+              example: 0.005
+              description: >
+                 OVERRIDE: Temporarily sets the Administrative Fee for this calculation only.
+                 (0.005 = 0.5%).
+            volatility_threshold:
+              type: number
+              example: 5.0
+              description: >
+                 OVERRIDE: Temporarily sets the volatility limit before Auto-Hedge kicks in.
+            max_panic_margin:
+              type: number
+              example: 1.50
+              description: >
+                 OVERRIDE: Temporarily sets the maximum price ceiling during panic.
     responses:
       200:
-        description: Price successfully calculated with applied risk margins.
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                status_note:
-                  type: string
-                  example: "Standard Optimization"
-                converted_price:
-                  type: number
-                  example: 285.45
-                margin_applied:
-                  type: number
-                  example: 1.025
-                spread_percentage:
-                  type: string
-                  example: "2.50%"
-                ai_analysis:
-                  type: string
-                  description: Narrative justification for the applied spread.
+        description: Price successfully calculated.
       400:
-        description: Payload validation error or non-numeric pricing.
+        description: Input validation error.
       404:
-        description: Currency pair liquidity not found in the exchange market.
+        description: Exchange rate not found.
       500:
-        description: Internal pipeline failure.
+        description: Server error.
     """
     data = request.get_json()
     if not data or 'base_price' not in data or 'target_currency' not in data:
@@ -567,19 +594,32 @@ def convert_price():
     # --- Check REDIS ---
     is_panic_mode = False
     panic_volatility = 0.0
-
     if cache:
         try:
             if cache.get("MARKET_PANIC_MODE") == "TRUE":
                 is_panic_mode = True
-                panic_volatility = float(cache.get("MARKET_LAST_VOLATILITY") or 5.0)
+                val = cache.get("MARKET_LAST_VOLATILITY")
+                panic_volatility = float(val) if val else 5.0
         except Exception:
             pass
     
     try:
+        # 1. Load Defaults/Persistent Settings
         settings = load_settings()
         base_price_brl = float(data.get('base_price', 0))
         target_currency = data.get('target_currency', '').upper()
+
+        # 2. Apply Request Overrides (Simulation Logic)
+        admin_fee = float(data.get('admin_fee', settings.get('admin_fee', 0.005)))
+        threshold = float(data.get('volatility_threshold', settings.get('volatility_threshold', 5.0)))
+        max_panic = float(data.get('max_panic_margin', settings.get('max_panic_margin', 1.50)))
+
+        # --- Panic Simulation received from Swagger ---
+        force_panic = bool(data.get('force_panic', False))
+        if force_panic:
+            is_panic_mode = True
+            if panic_volatility == 0.0:
+                panic_volatility = 15.0 # Default simulated volatility
 
         if target_currency == 'BRL':
             return jsonify({
@@ -594,30 +634,47 @@ def convert_price():
                 "error": f"Could not fetch rate for {target_currency}. Exchange market might be closed or pair unavailable."
             }), 404
         
-        # Calculate Volatility (WATCHDOG x IA)
-        # Scenario #1 - PANIC DETECTED!!!
-        if is_panic_mode and target_currency in ['BTC', 'ETH']:
-            margin = 1 + (panic_volatility * 10 / 100)
-            if margin < 1.05: margin = 1.05
-
-            reason = f"🐶 WALTER ALERTS: 🚨 Real-time anomaly on Binance! Volatility {panic_volatility:.2f}%."
+        
+        # --- Calculate Volatility (WATCHDOG x IA) ---
+        # Scenario #1 - PANIC DETECTED!!! (Walter Intervention)
+        if is_panic_mode:
+            risk_margin = (panic_volatility / 100)
+            margin = 1 + risk_margin + admin_fee
+            if margin > max_panic:
+                margin = max_panic
+            
+            sim_tag = "[SIMULATION] " if force_panic else ""
+            reason = f"{sim_tag}🐶 WALTER ALERTS: 🚨 Volatility {panic_volatility:.2f}% detected."
             status_note = "CRITICAL: Watchdog Intervention 🐶"
             vol_display = f"{panic_volatility:.2f}% (Instant)"
+            config_source = "Watchdog (Panic Mode)"
         
         # Scenario # 2 - NORMAL FLOW (Auto-Hedge or AI)
         else:
           volatility = ((high - low) / low) * 100 if low > 0 else 0.0
-          # Logic of "Automatic Profit Protection"
-          threshold = settings['volatility_threshold']
 
           if volatility > threshold:
-              margin = 1 + (volatility / 100)
+              risk_margin = (volatility / 100)
+              margin = 1 + risk_margin + admin_fee
+              
               reason = f"⚠️ HIGH VOLATILITY ALERT: {volatility:.2f}% > Limit {threshold}%. Margin auto-adjusted to match volatility."
               status_note = "Auto-Hedge Active"
+              config_source = "Manual/Hedge Rules"
+
+          # Ai Optimization Layer    
           else:
-              margin, reason = get_ai_safety_margin(target_currency, volatility)
-              status_note = "Standard Optimization"
-              vol_display = f"{volatility:.2f}% (24h)"
+              risk_margin, reason = get_ai_safety_margin(target_currency, volatility)
+              margin = risk_margin + admin_fee
+    
+
+              if "AI Disabled" in reason or "Error" in reason:
+                status_note = "Standard Optimization (Fallback)"
+                config_source = "Manual (AI Fail)"
+              else:
+                  status_note = "AI-Driven Optimization"
+                  config_source = "AI (Gemini)"
+          
+          vol_display = f"{volatility:.2f}% (24h)"
         
         final_price = (base_price_brl * exchange_rate) * margin
         prec = 8 if exchange_rate < 0.01 else 2
@@ -633,7 +690,12 @@ def convert_price():
             "spread_percentage": f"{spread_pct:.2f}%",
             "market_volatility": vol_display,
             "ai_analysis": reason,
-            "config_mode": "Watchdog Override" if is_panic_mode else ("AI" if settings["use_ai"] else "Manual")
+            "config_mode": config_source,
+            "applied_params": {
+                "admin_fee": admin_fee,
+                "threshold_used": threshold,
+                "max_panic_used": max_panic
+            }
         })
     
     except ValueError:

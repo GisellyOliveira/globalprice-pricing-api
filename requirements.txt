@@ -10,7 +10,7 @@ google-generativeai==0.7.2
 # Production Server (WSGI)
 gunicorn==22.0.0
 
-# Data & Real-time Messaging  <-- COLOQUE AQUI
+# Data & Real-time Messaging 
 redis==5.0.1
 websocket-client==1.8.0
 
